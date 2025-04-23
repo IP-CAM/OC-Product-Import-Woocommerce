@@ -69,7 +69,7 @@ class OpencartToWooCommerce:
             return 0
     
     def get_opencart_products(self):
-        """Opencart'tan ürünleri ve kategorilerini çeker"""
+        """Opencart'tan ürünleri, kategorilerini ve seçeneklerini çeker"""
         cursor = self.opencart_db.cursor(dictionary=True)
         
         # Ürün bilgilerini al
@@ -97,15 +97,21 @@ class OpencartToWooCommerce:
             images = cursor.fetchall()
             product['images'].extend([f"{os.getenv('DB_HOST_DOMAIN')}/image/{img['image']}" for img in images if img['image']])
             
-            # Seçenekler
+            # Seçenekleri detaylı şekilde al
             cursor.execute(f"""
-            SELECT ovd.name, o.price, o.price_prefix
+            SELECT 
+                od.name as option_name,
+                ovd.name as option_value,
+                o.price,
+                o.price_prefix
             FROM oc_product_option_value o
             JOIN oc_option_value_description ovd ON o.option_value_id = ovd.option_value_id
-            WHERE o.product_id = {product['product_id']} AND ovd.language_id = 1
+            JOIN oc_product_option po ON o.product_option_id = po.product_option_id
+            JOIN oc_option_description od ON po.option_id = od.option_id
+            WHERE po.product_id = {product['product_id']} AND ovd.language_id = 1 AND od.language_id = 1
             """)
             options = cursor.fetchall()
-            product['options'] = options
+            product['attributes'] = self.process_options(options)
             
             # Kategoriler
             cursor.execute(f"""
@@ -120,8 +126,22 @@ class OpencartToWooCommerce:
         cursor.close()
         return products
     
+    def process_options(self, options):
+        """Seçenekleri WooCommerce attribute formatına dönüştürür"""
+        attributes = {}
+        for option in options:
+            if option['option_name'] not in attributes:
+                attributes[option['option_name']] = {
+                    'name': option['option_name'],
+                    'options': [],
+                    'visible': True,
+                    'variation': True
+                }
+            attributes[option['option_name']]['options'].append(option['option_value'])
+        return list(attributes.values())
+    
     def create_woocommerce_product(self, product):
-        """WooCommerce'e ürün ve kategorilerini ekler"""
+        """WooCommerce'e ürün, nitelikleri ve kategorilerini ekler"""
         # Önce kategorileri oluştur
         wc_categories = []
         for cat_name in product.get('categories', []):
@@ -140,6 +160,7 @@ class OpencartToWooCommerce:
             'sku': product['model'],
             'images': [{'src': img} for img in product['images']],
             'categories': wc_categories,
+            'attributes': product.get('attributes', []),
             'meta_data': [
                 {'key': 'opencart_id', 'value': product['product_id']}
             ]
