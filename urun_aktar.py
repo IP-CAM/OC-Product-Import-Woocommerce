@@ -69,7 +69,7 @@ class OpencartToWooCommerce:
             return 0
     
     def get_opencart_products(self):
-        """Opencart'tan ürünleri, kategorilerini ve seçeneklerini çeker"""
+        """Opencart'tan ürünleri, kategorilerini ve varyasyonlarını çeker"""
         cursor = self.opencart_db.cursor(dictionary=True)
         
         # Ürün bilgilerini al
@@ -78,7 +78,6 @@ class OpencartToWooCommerce:
         FROM oc_product p
         JOIN oc_product_description pd ON p.product_id = pd.product_id
         WHERE pd.language_id = 1
-        LIMIT 2
         """
         cursor.execute(query)
         products = cursor.fetchall()
@@ -97,76 +96,98 @@ class OpencartToWooCommerce:
             images = cursor.fetchall()
             product['images'].extend([f"{os.getenv('DB_HOST_DOMAIN')}/image/{img['image']}" for img in images if img['image']])
             
-            # Seçenekleri detaylı şekilde al
+            # Varyasyonları detaylı şekilde al
             cursor.execute(f"""
             SELECT 
                 od.name as option_name,
                 ovd.name as option_value,
-                o.price,
-                o.price_prefix
-            FROM oc_product_option_value o
-            JOIN oc_option_value_description ovd ON o.option_value_id = ovd.option_value_id
-            JOIN oc_product_option po ON o.product_option_id = po.product_option_id
+                pov.price,
+                pov.price_prefix,
+                pov.quantity as stock_quantity
+            FROM oc_product_option_value pov
+            JOIN oc_option_value_description ovd ON pov.option_value_id = ovd.option_value_id
+            JOIN oc_product_option po ON pov.product_option_id = po.product_option_id
             JOIN oc_option_description od ON po.option_id = od.option_id
-            WHERE po.product_id = {product['product_id']} AND ovd.language_id = 1 AND od.language_id = 1
+            WHERE po.product_id = {product['product_id']} 
+            AND ovd.language_id = 1 
+            AND od.language_id = 1
             """)
-            options = cursor.fetchall()
-            product['attributes'] = self.process_options(options)
+            variations = cursor.fetchall()
             
-            # Kategoriler
+            # Eğer varyasyon fiyatı 0 ise, ürün fiyatını kullan
+            for var in variations:
+                if float(var.get('price', 0)) == 0:
+                    var['price'] = product['price']
+                    var['price_prefix'] = '+'
+            
+            product['options_data'] = self.process_variations(variations, product['price'])
+            
+            # Kategorileri al
             cursor.execute(f"""
-            SELECT cd.name 
-            FROM oc_product_to_category pc
+            SELECT cd.name FROM oc_product_to_category pc
             JOIN oc_category_description cd ON pc.category_id = cd.category_id
             WHERE pc.product_id = {product['product_id']} AND cd.language_id = 1
             """)
-            categories = cursor.fetchall()
-            product['categories'] = [cat['name'] for cat in categories]
+            product['categories'] = [cat['name'] for cat in cursor.fetchall()]
         
         cursor.close()
         return products
     
-    def process_options(self, options):
-        """Seçenekleri WooCommerce attribute formatına dönüştürür"""
+    def process_variations(self, variations, product_price=None):
+        """Varyasyonları WooCommerce formatına dönüştürür"""
         attributes = {}
-        for option in options:
-            if option['option_name'] not in attributes:
-                attributes[option['option_name']] = {
-                    'name': option['option_name'],
+        variation_list = []
+        
+        for i, var in enumerate(variations):
+            # Nitelikleri oluştur
+            if var['option_name'] not in attributes:
+                attributes[var['option_name']] = {
+                    'name': var['option_name'],
                     'options': [],
                     'visible': True,
                     'variation': True
                 }
-            attributes[option['option_name']]['options'].append(option['option_value'])
-        return list(attributes.values())
+            attributes[var['option_name']]['options'].append(var['option_value'])
+            
+            # Varyasyon fiyatını hesapla
+            price_modifier = 1 if var['price_prefix'] == '+' else -1
+            variation_price = float(var['price']) * price_modifier
+            
+            # Varyasyon verisi
+            variation = {
+                'attributes': [{
+                    'name': var['option_name'],
+                    'option': var['option_value']
+                }],
+                'regular_price': str(variation_price),
+                'stock_quantity': var.get('stock_quantity', 0),
+                'manage_stock': True
+            }
+            variation_list.append(variation)
+        
+        return {
+            'attributes': list(attributes.values()),
+            'variations': variation_list
+        }
     
     def create_woocommerce_product(self, product):
-        """WooCommerce'e ürün, nitelikleri ve kategorilerini ekler"""
-        # Önce kategorileri oluştur
-        wc_categories = []
-        for cat_name in product.get('categories', []):
-            cat_id = self.get_or_create_wc_category(cat_name)
-            if cat_id:
-                wc_categories.append({'id': cat_id})
-        
-        # HTML içeriğini decode et
-        decoded_description = html.unescape(product['description'])
-        
+        """WooCommerce'e varyasyonlu ürün ekler"""
+        # Ana ürün verisi
         data = {
             'name': product['name'],
-            'type': 'simple',
-            'regular_price': str(product['price']),
-            'description': decoded_description,
-            'sku': product['model'],
+            'type': 'variable',
+            'description': html.unescape(product['description']),
+            'short_description': '',
+            'categories': [{'id': self.get_or_create_wc_category(cat)} for cat in product['categories']],
             'images': [{'src': img} for img in product['images']],
-            'categories': wc_categories,
-            'attributes': product.get('attributes', []),
+            'attributes': product['options_data']['attributes'],
+            'default_attributes': [],
             'meta_data': [
                 {'key': 'opencart_id', 'value': product['product_id']}
             ]
         }
         
-        # API isteği gönder
+        # Ana ürünü oluştur
         response = requests.post(
             f"{self.wc_url}/products",
             auth=self.wc_auth,
@@ -175,16 +196,30 @@ class OpencartToWooCommerce:
         )
         
         if response.status_code == 201:
-            print(f"Ürün başarıyla eklendi: {product['name']}")
+            product_id = response.json()['id']
+            print(f"✅ Ana ürün oluşturuldu: {product['name']}")
+            
+            # Varyasyonları ekle
+            for variation in product['options_data']['variations']:
+                var_response = requests.post(
+                    f"{self.wc_url}/products/{product_id}/variations",
+                    auth=self.wc_auth,
+                    json=variation,
+                    headers={'Content-Type': 'application/json'}
+                )
+                if var_response.status_code == 201:
+                    print(f"  ↳ Varyasyon eklendi: {variation['attributes'][0]['option']} ({variation['regular_price']}₺)")
+                else:
+                    print(f"  ↳ ❌ Varyasyon hatası: {var_response.text}")
         else:
-            print(f"Hata oluştu: {response.text}")
+            print(f"❌ Ürün oluşturma hatası: {response.text}")
     
     def transfer_products(self):
-        """Tüm ürünleri ve kategorilerini aktarır"""
+        """Tüm ürünleri ve varyasyonlarını aktarır"""
         products = self.get_opencart_products()
         for product in products[:2]:  # Sadece ilk 2 ürün
             self.create_woocommerce_product(product)
-            print(f"{product['name']} ürünü aktarıldı (Toplam: {len(products)} ürün var)")
+            print(f"{product['name']} ürünü ve varyasyonları aktarıldı (Toplam: {len(products)} ürün var)")
         print("İlk 2 ürün aktarımı tamamlandı!")
 
 if __name__ == '__main__':
