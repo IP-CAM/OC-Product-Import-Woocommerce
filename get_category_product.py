@@ -68,16 +68,21 @@ class OpencartToWooCommerce:
             print(f"Kategori oluşturulamadı: {category_name}")
             return 0
     
-    def get_opencart_products(self):
-        """Opencart'tan ürünleri, kategorilerini ve varyasyonlarını çeker"""
+    def get_opencart_products(self, category_id=66):
+        """Opencart'tan ürünleri, kategorilerini ve varyasyonlarını çeker
+        Args:
+            category_id (int): Sadece bu kategori ID'sine ait ürünleri getir
+        """
         cursor = self.opencart_db.cursor(dictionary=True)
         
-        # Ürün bilgilerini al
-        query = """
+        # Ürün bilgilerini al (sadece belirtilen kategoriye ait olanlar)
+        query = f"""
         SELECT p.product_id, pd.name, p.model, p.price, pd.description, p.image
         FROM oc_product p
         JOIN oc_product_description pd ON p.product_id = pd.product_id
+        JOIN oc_product_to_category pc ON p.product_id = pc.product_id
         WHERE pd.language_id = 1
+        AND pc.category_id = {category_id}
         """
         cursor.execute(query)
         products = cursor.fetchall()
@@ -114,15 +119,9 @@ class OpencartToWooCommerce:
             """)
             variations = cursor.fetchall()
             
-            # Eğer varyasyon fiyatı 0 ise, ürün fiyatını kullan
-            for var in variations:
-                if float(var.get('price', 0)) == 0:
-                    var['price'] = product['price']
-                    var['price_prefix'] = '+'
+            product['options_data'] = self.process_variations(variations, float(product['price']))
             
-            product['options_data'] = self.process_variations(variations, product['price'])
-            
-            # Kategorileri al
+            # Kategorileri al (hepsini almaya devam ediyoruz)
             cursor.execute(f"""
             SELECT cd.name FROM oc_product_to_category pc
             JOIN oc_category_description cd ON pc.category_id = cd.category_id
@@ -133,12 +132,12 @@ class OpencartToWooCommerce:
         cursor.close()
         return products
     
-    def process_variations(self, variations, product_price=None):
+    def process_variations(self, variations, product_price):
         """Varyasyonları WooCommerce formatına dönüştürür"""
         attributes = {}
         variation_list = []
-        
-        for i, var in enumerate(variations):
+
+        for var in variations:
             # Nitelikleri oluştur
             if var['option_name'] not in attributes:
                 attributes[var['option_name']] = {
@@ -148,28 +147,37 @@ class OpencartToWooCommerce:
                     'variation': True
                 }
             attributes[var['option_name']]['options'].append(var['option_value'])
-            
+
             # Varyasyon fiyatını hesapla
-            price_modifier = 1 if var['price_prefix'] == '+' else -1
-            variation_price = float(var['price']) * price_modifier
+            var_price = float(var.get('price', 0))
             
+            # Price_prefix'e göre fiyatı hesapla
+            if var['price_prefix'] == '+':
+                variation_price = product_price + var_price
+            elif var['price_prefix'] == '-':
+                variation_price = product_price - var_price
+            else:
+                # Prefix yoksa veya farklı bir değerse, varyasyon fiyatını kullan
+                # Eğer varyasyon fiyatı 0 ise, ürün fiyatını kullan
+                variation_price = var_price if var_price > 0 else product_price
+
             # Varyasyon verisi
             variation = {
                 'attributes': [{
                     'name': var['option_name'],
                     'option': var['option_value']
                 }],
-                'regular_price': str(variation_price),
+                'regular_price': str(round(variation_price, 2)),
                 'stock_quantity': var.get('stock_quantity', 0),
                 'manage_stock': True
             }
             variation_list.append(variation)
-        
+
         return {
             'attributes': list(attributes.values()),
             'variations': variation_list
         }
-    
+        
     def create_woocommerce_product(self, product):
         """WooCommerce'e varyasyonlu ürün ekler"""
         # Ana ürün verisi
@@ -214,14 +222,24 @@ class OpencartToWooCommerce:
         else:
             print(f"❌ Ürün oluşturma hatası: {response.text}")
     
-    def transfer_products(self):
-        """Tüm ürünleri ve varyasyonlarını aktarır"""
-        products = self.get_opencart_products()
-        for product in products:  # Tüm ürünler aktarılacak
+    def transfer_products(self, category_id=66):
+        """Belirtilen kategori ID'sine ait ürünleri aktarır
+        Args:
+            category_id (int): Aktarılacak ürünlerin kategori ID'si (varsayılan: 66)
+        """
+        products = self.get_opencart_products(category_id)
+        total_products = len(products)
+        
+        print(f"Kategori ID: {category_id} için ürünler aktarılıyor (Toplam: {total_products} ürün)")
+        
+        for i, product in enumerate(products, 1):
             self.create_woocommerce_product(product)
-            print(f"{product['name']} ürünü ve varyasyonları aktarıldı (Toplam: {len(products)} ürün var)")
-        print("Tüm ürünlerin aktarımı tamamlandı!")
+            print(f"[{i}/{total_products}] {product['name']} ürünü ve varyasyonları aktarıldı")
+        
+        print("Aktarım tamamlandı!")
 
 if __name__ == '__main__':
     transfer = OpencartToWooCommerce()
-    transfer.transfer_products()
+    
+    # Sadece kategori ID'si 66 olan ürünleri aktar
+    transfer.transfer_products(category_id=66)
