@@ -77,7 +77,7 @@ class OpencartToWooCommerce:
         SELECT p.product_id, pd.name, p.model, p.price, pd.description, p.image
         FROM oc_product p
         JOIN oc_product_description pd ON p.product_id = pd.product_id
-        WHERE pd.language_id = 1
+        WHERE pd.language_id = 1 
         """
         cursor.execute(query)
         products = cursor.fetchall()
@@ -114,13 +114,7 @@ class OpencartToWooCommerce:
             """)
             variations = cursor.fetchall()
             
-            # Eğer varyasyon fiyatı 0 ise, ürün fiyatını kullan
-            for var in variations:
-                if float(var.get('price', 0)) == 0:
-                    var['price'] = product['price']
-                    var['price_prefix'] = '+'
-            
-            product['options_data'] = self.process_variations(variations, product['price'])
+            product['options_data'] = self.process_variations(variations, float(product['price']))
             
             # Kategorileri al
             cursor.execute(f"""
@@ -133,12 +127,12 @@ class OpencartToWooCommerce:
         cursor.close()
         return products
     
-    def process_variations(self, variations, product_price=None):
+    def process_variations(self, variations, product_price):
         """Varyasyonları WooCommerce formatına dönüştürür"""
         attributes = {}
         variation_list = []
         
-        for i, var in enumerate(variations):
+        for var in variations:
             # Nitelikleri oluştur
             if var['option_name'] not in attributes:
                 attributes[var['option_name']] = {
@@ -150,8 +144,17 @@ class OpencartToWooCommerce:
             attributes[var['option_name']]['options'].append(var['option_value'])
             
             # Varyasyon fiyatını hesapla
-            price_modifier = 1 if var['price_prefix'] == '+' else -1
-            variation_price = float(var['price']) * price_modifier
+            var_price = float(var.get('price', 0))
+            
+            # Price_prefix'e göre fiyatı hesapla
+            if var['price_prefix'] == '+':
+                variation_price = product_price + var_price
+            elif var['price_prefix'] == '-':
+                variation_price = product_price - var_price
+            else:
+                # Prefix yoksa veya farklı bir değerse, varyasyon fiyatını kullan
+                # Eğer varyasyon fiyatı 0 ise, ürün fiyatını kullan
+                variation_price = var_price if var_price > 0 else product_price
             
             # Varyasyon verisi
             variation = {
@@ -159,7 +162,7 @@ class OpencartToWooCommerce:
                     'name': var['option_name'],
                     'option': var['option_value']
                 }],
-                'regular_price': str(variation_price),
+                'regular_price': str(round(variation_price, 2)),
                 'stock_quantity': var.get('stock_quantity', 0),
                 'manage_stock': True
             }
@@ -217,9 +220,14 @@ class OpencartToWooCommerce:
     def transfer_products(self):
         """Tüm ürünleri ve varyasyonlarını aktarır"""
         products = self.get_opencart_products()
-        for product in products:  # Tüm ürünler aktarılacak
+        total_products = len(products)
+        
+        print(f"Toplam {total_products} ürün aktarılacak")
+        
+        for i, product in enumerate(products, 1):
             self.create_woocommerce_product(product)
-            print(f"{product['name']} ürünü ve varyasyonları aktarıldı (Toplam: {len(products)} ürün var)")
+            print(f"[{i}/{total_products}] {product['name']} ürünü ve varyasyonları aktarıldı")
+        
         print("Tüm ürünlerin aktarımı tamamlandı!")
 
 if __name__ == '__main__':
